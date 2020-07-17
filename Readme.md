@@ -1,5 +1,5 @@
-# Gaussian Streaming Model 
+# Spherical Collapse Model
 
-Package for modelling redshift-space distortions in the galaxy two-point correlation function, using the Gaussian Streaming Model (Fisher 1995).
+Package for modelling redshift-space distortions using the Spherical Collapse Model.
 
 Documentation coming soon.
