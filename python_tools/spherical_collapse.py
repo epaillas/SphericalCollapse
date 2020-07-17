@@ -1,12 +1,10 @@
 import numpy as np
 import sys
 import os
-import matplotlib.pyplot as plt
-from astropy.io import fits
 from utilities import Cosmology, Utilities
 from scipy.integrate import quad, simps, odeint
 from scipy.interpolate import RectBivariateSpline, InterpolatedUnivariateSpline, interp1d, interp2d
-from scipy.optimize import fsolve
+from scipy.optimize import fsolve, odeint
 from scipy.signal import savgol_filter
 from scipy.stats import norm
 from scipy.special import eval_legendre, legendre
@@ -14,6 +12,7 @@ from scipy.special import eval_legendre, legendre
 class SingleFit:
     def __init__(self,
                  xi_r_filename,
+                 delta_r_filename,
                  xi_smu_filename,
                  covmat_filename=None,
                  sv_filename=None,
@@ -24,12 +23,13 @@ class SingleFit:
                  model=1,
                  const_sv=0,
                  model_as_truth=0,
-                 om_m=0.285,
+                 Omega_m0=0.285,
                  s8=0.828,
                  eff_z=0.57,
-                 vr_coupling='autocorr'):
+                 vr_coupling='spherical'):
 
         self.xi_r_filename = xi_r_filename
+        self.delta_r_filename = delta_r_filename
         self.sv_filename = sv_filename
         self.vr_filename = vr_filename
         self.xi_smu_filename = xi_smu_filename
@@ -47,9 +47,9 @@ class SingleFit:
         print("Setting up redshift-space distortions model.")
 
         # cosmology for Minerva
-        self.om_m = om_m
+        self.Omega_m0 = Omega_m0
         self.s8 = s8
-        self.cosmo = Cosmology(om_m=self.om_m)
+        self.cosmo = Cosmology(om_m=self.Omega_m0)
         self.nmocks = 299 # hardcoded for Minerva
 
         self.eff_z = eff_z
@@ -61,15 +61,16 @@ class SingleFit:
         self.beta = self.f / self.b
         self.s8norm = self.s8 * self.growth 
 
-        eofz = np.sqrt((self.om_m * (1 + self.eff_z) ** 3 + 1 - self.om_m))
+        eofz = np.sqrt((self.Omega_m0 * (1 + self.eff_z) ** 3 + 1 - self.Omega_m0))
         self.iaH = (1 + self.eff_z) / (100. * eofz)
 
+        # set this to true if you want to test the 
+        # performance of the model using the 
+        # measured radial velocities
         if self.vr_coupling == 'true':
             print('Using true radial velocity profile.')
-        elif self.vr_coupling == 'autocorr':
-            print('Using velocity-to-density coupling for autocorrelation.')
-        elif self.vr_coupling == 'crosscorr':
-            print('Using velocity-to-density coupling for cross-correlation')
+        elif self.vr_coupling == 'spherical':
+            print('Calculating peculiar velocities from spherical collapse.')
         else:
             sys.exit('Velocity-to-density coupling not recognized.')
 
@@ -86,12 +87,18 @@ class SingleFit:
                                                         - (self.r_for_xi[:i+1] - dr/2)**3)))
         self.int_xi_r = InterpolatedUnivariateSpline(self.r_for_xi, int_xi_r, k=3, ext=0)
 
-        int2_xi_r = np.zeros_like(self.r_for_xi)
-        dr = np.diff(self.r_for_xi)[0]
-        for i in range(len(int2_xi_r)):
-            int2_xi_r[i] = 1./(self.r_for_xi[i]+dr/2)**5 * (np.sum(xi_r[:i+1]*((self.r_for_xi[:i+1]+dr/2)**5
-                                                        - (self.r_for_xi[:i+1] - dr/2)**5)))
-        self.int2_xi_r = InterpolatedUnivariateSpline(self.r_for_xi, int2_xi_r, k=3, ext=0)
+        # read void-matter correlation function
+        data = np.genfromtxt(self.delta_r_filename)
+        self.r_for_delta = data[:,0]
+        delta_r = data[:,-2]
+
+        Delta_r = np.zeros_like(self.r_for_delta)
+        dr = np.diff(self.r_for_delta)[0]
+        for i in range(len(Delta_r)):
+            Delta_r[i] = 1./(self.r_for_delta[i]+dr/2)**3 * (np.sum(delta_r[:i+1]*((self.r_for_delta[:i+1]+dr/2)**3
+                                                        - (self.r_for_delta[:i+1] - dr/2)**3)))
+        self.Delta_r = InterpolatedUnivariateSpline(self.r_for_delta, Delta_r, k=3, ext=3)
+        self.delta_r = InterpolatedUnivariateSpline(self.r_for_delta, delta_r, k=3, ext=3)
 
         # read los velocity dispersion profile
         self.r_for_v, self.mu_for_v, sv = Utilities.ReadData_TwoDims(self.sv_filename)
@@ -111,20 +118,19 @@ class SingleFit:
 
         if self.model_as_truth:
             print('Using the model prediction as the measurement.')
-            if self.model == 1:
-                fs8 = self.f * self.s8norm
-                sigma_v = self.sv_converge
-                alpha = 1.0
-                epsilon = 1.0
-                alpha_para = alpha * epsilon ** (-2/3)
-                alpha_perp = epsilon * alpha_para
+            sigma_v = self.sv_converge
+            alpha = 1.0
+            epsilon = 1.0
+            alpha_para = alpha * epsilon ** (-2/3)
+            alpha_perp = epsilon * alpha_para
 
-                self.xi0_s, self.xi2_s, self.xi4_s = self.model1_theory(fs8,
-                                                            sigma_v,
-                                                            alpha_perp,
-                                                            alpha_para,
-                                                            self.s_for_xi,
-                                                            self.mu_for_xi)
+            self.xi0_s, self.xi2_s, self.xi4_s = self.multipoles_theory(
+                                                        self.Omega_m0,
+                                                        sigma_v,
+                                                        alpha_perp,
+                                                        alpha_para,
+                                                        self.s_for_xi,
+                                                        self.mu_for_xi)
         else:
             s, self.xi0_s = Utilities.getMultipole(0, self.s_for_xi, self.mu_for_xi, self.xi_smu)
             s, self.xi2_s = Utilities.getMultipole(2, self.s_for_xi, self.mu_for_xi, self.xi_smu)
@@ -156,20 +162,61 @@ class SingleFit:
         else:
             self.datavec = self.xi2_s
         
-    def model1_theory(self, fs8, sigma_v, alpha_perp, alpha_para, s, mu):
+
+    def multipoles_theory(self, Omega_m0, sigma_v, alpha_perp, alpha_para, s, mu):
         '''
-        Gaussian streaming model (Fisher 1995)
+        RSD model that relies on spherical collapse model 
+        to map from densities to velocities.
         '''
-        beta = fs8 / (self.b * self.s8norm)
+
         monopole = np.zeros(len(s))
         quadrupole = np.zeros(len(s))
         hexadecapole = np.zeros(len(s))
         true_mu = np.zeros(len(mu))
         xi_model = np.zeros(len(mu))
 
+        if self.vr_coupling == 'spherical':
+            # set up parameters for spherical collapse
+            Omega_L0 = 1 - Omega_m0
+            zi = 999
+            zf = self.eff_z
+            z = np.linspace(zi, zf, 100)
+            a = 1/(1 + z)
+            t = CosmologicalTime(zi, zf)
+
+            # array of initial linear densities
+            Delta_i = np.linspace(-0.01, 0.0025, 1000)
+
+            # find solutions to spherical collapse ODE
+            sol1 = []
+            sol2 = []
+            for dl in Delta_i:
+                g0 = [1 - dl/3, -dl/3]
+                sol = odeint(SphericalCollapse, g0, t, args=(Omega_m0, Omega_L0))
+                y = sol[:,0]
+                yprime = sol[:,1]
+                sol1.append(y[-1]**-3 - 1)
+                sol2.append(yprime[-1])
+
+            # find the initial Deltas that match the late ones
+            interp_Delta = InterpolatedUnivariateSpline(sol1, Delta_i, k=3, ext=0)
+            matched_Delta_i = interp_Delta(self.Delta_r(self.r_for_delta))
+
+            # find the peculiar velocities associated to late Deltas
+            interp_vpec = InterpolatedUnivariateSpline(Delta_i, sol2, k=3, ext=0)
+            matched_vpec = interp_vpec(matched_Delta_i)
+
+            # transform peculiar velocities to desired units
+            H = Hubble(a=a[-1], Omega_m0=Omega_m0, Omega_L0=Omega_L0)
+            q = self.r_for_delta * a[-1] * (1 + self.Delta_r(self.r_for_delta))**(1/3) 
+            vpec = matched_vpec * H * q
+            dvpec = np.gradient(vpec, self.r_for_delta)
+            self.vr = InterpolatedUnivariateSpline(self.r_for_delta, vpec, k=3, ext=0)
+            self.dvr = InterpolatedUnivariateSpline(self.r_for_delta, dvpec, k=3, ext=0)
+
         # rescale input monopole functions to account for alpha values
-        mus = np.linspace(0, 1., 100)
-        r = self.r_for_xi
+        mus = np.linspace(0, 1., 80)
+        r = self.r_for_delta
         rescaled_r = np.zeros_like(r)
         for i in range(len(r)):
             rescaled_r[i] = np.trapz((r[i] * alpha_para) * np.sqrt(1. + (1. - mus ** 2) *
@@ -177,13 +224,15 @@ class SingleFit:
 
         x = rescaled_r
         y1 = self.xi_r(r)
-        y2 = self.int_xi_r(r)
-        y3 = self.sv(r, self.mu_for_v)
+        y2 = self.vr(r)
+        y3 = self.dvr(r)
+        y4 = self.sv(r)
 
         # build rescaled interpolating functions using the relabelled separation vectors
         rescaled_xi_r = InterpolatedUnivariateSpline(x, y1, k=3, ext=0)
-        rescaled_int_xi_r = InterpolatedUnivariateSpline(x, y2, k=3, ext=0)
-        rescaled_sv = RectBivariateSpline(x, self.mu_for_v, y3)
+        rescaled_vr = InterpolatedUnivariateSpline(x, y2, k=3, ext=0)
+        rescaled_dvr = InterpolatedUnivariateSpline(x, y3, k=3, ext=0)
+        rescaled_sv = InterpolatedUnivariateSpline(x, y4, k=3, ext=0)
         sigma_v = alpha_para * sigma_v
 
         for i in range(len(s)):
@@ -193,31 +242,29 @@ class SingleFit:
                 true_s = np.sqrt(true_spar ** 2. + true_sperp ** 2.)
                 true_mu[j] = true_spar / true_s
 
-                rpar = true_spar
+                # solve Eq. 7 from arXiv 1712.07575
+                def residual(rpar):
+                    rperp = true_sperp
+                    r = np.sqrt(rpar**2 + rperp**2)
+                    mu = rpar / r
+                    res = rpar - true_spar + rescaled_vr(r)*mu * self.iaH
+                    return res
 
-                # build the integration variable
-                sy = 500 * self.iaH
-                y = np.linspace(-5 * sy, 5 * sy, 200)
+                rpar = fsolve(func=residual, x0=true_spar)[0]
+
+                sy_central = sigma_v * rescaled_sv(np.sqrt(true_sperp**2 + rpar**2)) * self.iaH
+                y = np.linspace(-5 * sy_central, 5 * sy_central, 200)
 
                 rpary = rpar - y
                 rr = np.sqrt(true_sperp ** 2 + rpary ** 2)
-                mur = rpary / rr
-                sy = sigma_v * rescaled_sv.ev(rr, mur) * self.iaH
+                sy = sigma_v * rescaled_sv(rr) * self.iaH
 
-                if self.vr_coupling == 'true':
-                    vrmu = self.vr(rr) * mur * self.iaH
-                elif self.vr_coupling == 'autocorr':
-                    alpha = 0.5
-                    int2_xi_r = rescaled_int_xi_r(rr) / (1 + rescaled_xi_r(rr))
-                    vrmu = -2/3 * beta * rr * int2_xi_r * (1 + alpha * int2_xi_r) * mur
-                else:
-                    vrmu = -1/3 * beta * rr * rescaled_int_xi_r(rr) * mur
+                integrand = (1 + rescaled_xi_r(rr)) * (1 + rescaled_vr(rr)/(rr/self.iaH) +\
+                                                (rescaled_dvr(rr) - rescaled_vr(rr)/rr)*self.iaH * true_mu[j]**2)**(-1)
 
-                los_pdf = norm.pdf(y, loc=vrmu, scale=sy)
+                integrand = integrand * np.exp(-(y**2) / (2 * sy**2)) / (np.sqrt(2 * np.pi) * sy)
 
-                integrand = los_pdf * (1 + rescaled_xi_r(rr))
-
-                xi_model[j] = simps(integrand, y) - 1
+                xi_model[j] = np.trapz(integrand, y) - 1
 
 
             # build interpolating function for xi_smu at true_mu
@@ -253,100 +300,19 @@ class SingleFit:
         return monopole, quadrupole, hexadecapole
 
 
-    def model2_theory(self, fs8, alpha_perp, alpha_para, s, mu):
-        '''
-        Linear model (Eq. 44-46 from Hernandez-Aguayo et at. 2018)
-        '''
-        beta = fs8 / (self.b * self.s8norm)
-        monopole = np.zeros(len(s))
-        quadrupole = np.zeros(len(s))
-        hexadecapole = np.zeros(len(s))
-        true_mu = np.zeros(len(mu))
-        xi_model = np.zeros(len(mu))
-
-        # rescale input monopole functions to account for alpha values
-        mus = np.linspace(0, 1., 100)
-        r = self.r_for_xi
-        rescaled_r = np.zeros_like(r)
-        for i in range(len(r)):
-            rescaled_r[i] = np.trapz((r[i] * alpha_para) * np.sqrt(1. + (1. - mus ** 2) *
-                            (alpha_perp ** 2 / alpha_para ** 2 - 1)), mus)
-
-        x = rescaled_r
-        y1 = self.xi_r(r)
-        y3 = self.int_xi_r(r)
-        y4 = self.int2_xi_r(r)
-
-        # build rescaled interpolating functions using the relabelled separation vectors
-        rescaled_xi_r = InterpolatedUnivariateSpline(x, y1, k=3, ext=0)
-        rescaled_int_xi_r = InterpolatedUnivariateSpline(x, y3, k=3, ext=0)
-        rescaled_int2_xi_r = InterpolatedUnivariateSpline(x, y4, k=3, ext=0)
-
-        for i in range(len(s)):
-            for j in range(len(mu)):
-                true_sperp = s[i] * np.sqrt(1 - mu[j] ** 2) * alpha_perp
-                true_spar = s[i] * mu[j] * alpha_para
-                true_s = np.sqrt(true_spar ** 2. + true_sperp ** 2.)
-                true_mu[j] = true_spar / true_s
-
-                r = true_s
-
-                xi_model[j] = eval_legendre(0, true_mu[j]) * (1 + 2/3*beta + 1/5 * beta**2) * rescaled_xi_r(r) \
-                            + eval_legendre(2, true_mu[j]) * (4/3 * beta + 4/7 * beta**2) * (rescaled_xi_r(r) - rescaled_int_xi_r(r)) \
-                            + eval_legendre(4, true_mu[j]) * (8/35 * beta**2) * (rescaled_xi_r(r) + 5/2 * rescaled_int_xi_r(r) - 7/2 * rescaled_int2_xi_r(r))
-
-            # build interpolating function for xi_smu at true_mu
-            mufunc = InterpolatedUnivariateSpline(true_mu[np.argsort(true_mu)],
-                                                  xi_model[np.argsort(true_mu)],
-                                                  k=3)
-
-            if true_mu.min() < 0:
-                mumin = -1
-                factor = 2
-            else:
-                mumin = 0
-                factor = 1
-
-            # get multipoles
-            xaxis = np.linspace(mumin, 1, 1000)
-
-            ell = 0
-            lmu = eval_legendre(ell, xaxis)
-            yaxis = mufunc(xaxis) * (2 * ell + 1) / factor * lmu
-            monopole[i] = simps(yaxis, xaxis)
-
-            ell = 2
-            lmu = eval_legendre(ell, xaxis)
-            yaxis = mufunc(xaxis) * (2 * ell + 1) / factor * lmu
-            quadrupole[i] = simps(yaxis, xaxis)
-
-            ell = 4
-            lmu = eval_legendre(ell, xaxis)
-            yaxis = mufunc(xaxis) * (2 * ell + 1) / factor * lmu
-            hexadecapole[i] = simps(yaxis, xaxis)
-            
-        return monopole, quadrupole, hexadecapole
-
-
     def log_likelihood(self, theta):
         if self.model == 1:
-            fs8, sigma_v, epsilon = theta
+            Omega_m0, sigma_v, epsilon = theta
         else:
-            fs8, epsilon = theta
+            Omega_m0, epsilon = theta
 
         alpha = 1.0
         alpha_para = alpha * epsilon ** (-2/3)
         alpha_perp = epsilon * alpha_para
 
         if self.model == 1:
-            xi0, xi2, xi4 = self.model1_theory(fs8,
+            xi0, xi2, xi4 = self.multipoles_theory(Omega_m0,
                                           sigma_v,
-                                          alpha_perp,
-                                          alpha_para,
-                                          self.s_for_xi,
-                                          self.mu_for_xi)
-        else:
-            xi0, xi2, xi4 = self.model2_theory(fs8,
                                           alpha_perp,
                                           alpha_para,
                                           self.s_for_xi,
@@ -363,396 +329,49 @@ class SingleFit:
 
     def log_prior(self, theta):
         if self.model == 1:
-            fs8, sigma_v, epsilon = theta
-            if 0.1 < fs8 < 2.0 and 10 < sigma_v < 700 and 0.8 < epsilon < 1.2:
+            Omega_m0, sigma_v, epsilon = theta
+            if 0.1 < Omega_m0 < 2.0 and 10 < sigma_v < 700 and 0.8 < epsilon < 1.2:
                 return 0.0
         else:
-            fs8, epsilon = theta
-            if 0.1 < fs8 < 2.0 and 0.8 < epsilon < 1.2:
+            Omega_m0, epsilon = theta
+            if 0.1 < Omega_m0 < 2.0 and 0.8 < epsilon < 1.2:
                 return 0.0
         
         return -np.inf
 
-class JointFit:
-    def __init__(self,
-                 xi_r_filename,
-                 xi_smu_filename,
-                 covmat_filename,
-                 smin,
-                 smax,
-                 vr_filename=None,
-                 sv_filename=None,
-                 full_fit=1,
-                 model=1,
-                 model_as_truth=0,
-                 const_sv=0,
-                 om_m=0.285,
-                 s8=0.828,
-                 eff_z=0.57,
-                 vr_coupling='autocorr'):
 
-        self.vr_coupling = vr_coupling
-        xi_r_filenames = xi_r_filename.split(',')
-        sv_filenames = sv_filename.split(',')
-        xi_smu_filenames = xi_smu_filename.split(',')
-        smins = [int(i) for i in smin.split(',')]
-        smaxs = [int(i) for i in smax.split(',')]
-        if self.vr_coupling == 'true':
-            vr_filenames = vr_filename.split(',')
-            vr_filename = {}
-
-        self.ndenbins = len(xi_r_filenames)
-        xi_r_filename = {}
-        xi_smu_filename = {}
-        sv_filename = {}
-        smin = {}
-        smax = {}
-
-        for j in range(self.ndenbins):
-            xi_r_filename['den{}'.format(j)] = xi_r_filenames[j]
-            sv_filename['den{}'.format(j)] = sv_filenames[j]
-            xi_smu_filename['den{}'.format(j)] = xi_smu_filenames[j]
-            smin['den{}'.format(j)] = smins[j]
-            smax['den{}'.format(j)] = smaxs[j]
-            if self.vr_coupling == 'true':
-                vr_filename['den{}'.format(j)] = vr_filenames[j]
-            
-
-        # full fit (monopole + quadrupole)
-        self.full_fit = full_fit
-        self.model = model
-        self.model_as_truth = model_as_truth
-        self.const_sv = const_sv
-
-        print("Setting up redshift-space distortions model.")
-
-        # cosmology for Minerva
-        self.om_m = om_m
-        self.s8 = s8
-        self.cosmo = Cosmology(om_m=self.om_m)
-        self.nmocks = 299 # hardcoded for Minerva
-        self.eff_z = eff_z
-
-        self.growth = self.cosmo.get_growth(self.eff_z)
-        self.f = self.cosmo.get_f(self.eff_z)
-        self.b = 2.01
-        self.s8norm = self.s8 * self.growth 
-
-        eofz = np.sqrt((self.om_m * (1 + self.eff_z) ** 3 + 1 - self.om_m))
-        self.iaH = (1 + self.eff_z) / (100. * eofz) 
-
-        # read covariance matrix
-        if os.path.isfile(covmat_filename):
-            print('Reading covariance matrix: ' + covmat_filename)
-            self.cov = np.load(covmat_filename)
-            self.icov = np.linalg.inv(self.cov)
-        else:
-            sys.exit('Covariance matrix not found.')
-
-        if self.vr_coupling == 'true':
-            print('Using true radial velocity profile.')
-        elif self.vr_coupling == 'autocorr':
-            print('Using velocity-to-density coupling for autocorrelation.')
-        elif self.vr_coupling == 'crosscorr':
-            print('Using velocity-to-density coupling for cross-correlation')
-        else:
-            sys.exit('Velocity-to-density coupling not recognized.')
-
-        self.r_for_xi = {}
-        self.s_for_xi = {}
-        self.mu_for_xi = {}
-        self.xi_r = {}
-        self.int_xi_r = {}
-        self.int2_xi_r = {}
-        self.xi0_s = {}
-        self.xi2_s = {}
-        self.xi4_s = {}
-
-        if self.model == 1:
-            self.r_for_v = {}
-            self.mu_for_v = {}
-            self.sv = {}
-            self.sv_converge = {}
-
-        if self.vr_coupling == 'true':
-            self.vr = {}
-
-        self.datavec = np.array([])
-
-        for j in range(self.ndenbins):
-            denbin = 'den{}'.format(j)
-            # read real-space monopole
-            data = np.genfromtxt(xi_r_filename[denbin])
-            self.r_for_xi[denbin] = data[:,0]
-            xi_r = data[:,-2]
-            self.xi_r[denbin] = InterpolatedUnivariateSpline(self.r_for_xi[denbin], xi_r, k=3, ext=0)
-
-            r = self.r_for_xi[denbin]
-            int_xi_r = np.zeros_like(r)
-            dr = np.diff(r)[0]
-            for i in range(len(int_xi_r)):
-                int_xi_r[i] = 1./(r[i]+dr/2)**3 * (np.sum(xi_r[:i+1]*((r[:i+1]+dr/2)**3
-                                                            - (r[:i+1] - dr/2)**3)))
-            self.int_xi_r[denbin] = InterpolatedUnivariateSpline(r, int_xi_r, k=3, ext=0)
-
-            int2_xi_r = np.zeros_like(r)
-            dr = np.diff(r)[0]
-            for i in range(len(int2_xi_r)):
-                int2_xi_r[i] = 1./(r[i]+dr/2)**5 * (np.sum(xi_r[:i+1]*((r[:i+1]+dr/2)**5
-                                                            - (r[:i+1] - dr/2)**5)))
-            self.int2_xi_r[denbin] = InterpolatedUnivariateSpline(r, int2_xi_r, k=3, ext=0)
-
-            if self.vr_coupling == 'true':
-                # read radial velocity
-                data = np.genfromtxt(vr_filename[denbin])
-                self.r_for_v[denbin] = data[:,0]
-                vr = data[:,-2]
-                self.vr[denbin] = InterpolatedUnivariateSpline(self.r_for_v[denbin], vr, k=3, ext=0)
-
-
-            if self.model == 1:
-                self.r_for_v[denbin], self.mu_for_v[denbin], sv = Utilities.ReadData_TwoDims(sv_filename[denbin])
-                self.sv_converge[denbin] = sv[-1, -1]
-
-                if self.const_sv:
-                    sv = np.ones(len(self.r_for_v[denbin]))
-                else:
-                    sv /= self.sv_converge[denbin]
-
-                self.sv[denbin] = RectBivariateSpline(self.r_for_v[denbin],
-                                                      self.mu_for_v[denbin],
-                                                      sv)
-
-            # read redshift-space correlation function
-            self.s_for_xi[denbin], self.mu_for_xi[denbin], xi_smu_obs = Utilities.ReadData_TwoDims(xi_smu_filename[denbin])
-
-            if self.model_as_truth:
-                print('Using the model prediction as the measurement.')
-                if self.model == 1:
-                    fs8 = self.f * self.s8norm
-                    sigma_v = self.sv_converge[denbin]
-                    alpha = 1.0
-                    epsilon = 1.0
-                    alpha_para = alpha * epsilon ** (-2/3)
-                    alpha_perp = epsilon * alpha_para
-
-                    self.xi0_s[denbin], self.xi2_s[denbin], self.xi4_s[denbin] = self.model1_theory(fs8,
-                                                                                sigma_v,
-                                                                                alpha_perp,
-                                                                                alpha_para,
-                                                                                self.s_for_xi[denbin],
-                                                                                self.mu_for_xi[denbin],
-                                                                                denbin)
-
-            else:
-                s, self.xi0_s[denbin] = Utilities.getMultipole(0, self.s_for_xi[denbin], self.mu_for_xi[denbin], xi_smu_obs)
-                s, self.xi2_s[denbin] = Utilities.getMultipole(2, self.s_for_xi[denbin], self.mu_for_xi[denbin], xi_smu_obs)
-                s, self.xi4_s[denbin] = Utilities.getMultipole(4, self.s_for_xi[denbin], self.mu_for_xi[denbin], xi_smu_obs)
-
-
-            # restrict measured vectors to the desired fitting scales
-            scales = (self.s_for_xi[denbin] >= smin[denbin]) & (self.s_for_xi[denbin] <= smax[denbin])
-
-            self.s_for_xi[denbin] = self.s_for_xi[denbin][scales]
-            self.xi0_s[denbin] = self.xi0_s[denbin][scales]
-            self.xi2_s[denbin] = self.xi2_s[denbin][scales]
-            self.xi4_s[denbin] = self.xi4_s[denbin][scales]
-
-            if self.full_fit:
-                self.datavec = np.concatenate((self.datavec, self.xi0_s[denbin], self.xi2_s[denbin]))
-            else:
-                self.datavec = np.concatenate((self.datavec, self.xi2_s[denbin]))
-
-        
-
-    def log_likelihood(self, theta):
-        if self.model == 1:
-            if self.ndenbins == 2:
-                fs8, sigma_v1, sigma_v2, epsilon = theta
-                sigmalist = [sigma_v1, sigma_v2]
-
-            if self.ndenbins == 3:
-                fs8, sigma_v1, sigma_v2, sigma_v3, epsilon = theta
-                sigmalist = [sigma_v1, sigma_v2, sigma_v3]
-                
-            if self.ndenbins == 4:
-                fs8, sigma_v1, sigma_v2, sigma_v3, sigma_v4, epsilon = theta
-                sigmalist = [sigma_v1, sigma_v2, sigma_v3, sigma_v4]
-
-            if self.ndenbins == 5:
-                fs8, sigma_v1, sigma_v2, sigma_v3, sigma_v4, sigma_v5, epsilon = theta
-                sigmalist = [sigma_v1, sigma_v2, sigma_v3, sigma_v4, sigma_v5]
-
-        alpha = 1.0
-        alpha_para = alpha * epsilon ** (-2/3)
-        alpha_perp = epsilon * alpha_para
-
-        sigma_v = {}
-        modelvec = np.array([])
-
-        for j in range(self.ndenbins):
-            denbin = 'den{}'.format(j)
-            sigma_v[denbin] = sigmalist[j]
-
-            if self.model == 1:
-                xi0, xi2, xi4 = self.model1_theory(fs8,
-                                            sigma_v[denbin],
-                                            alpha_perp,
-                                            alpha_para,
-                                            self.s_for_xi[denbin],
-                                            self.mu_for_xi[denbin],
-                                            denbin)
-
-            if self.full_fit:
-                modelvec = np.concatenate((modelvec, xi0, xi2))
-            else:
-                modelvec = np.concatenate((modelvec, xi2))
-
-        chi2 = np.dot(np.dot((modelvec - self.datavec), self.icov), modelvec - self.datavec)
-        loglike = -self.nmocks/2 * np.log(1 + chi2/(self.nmocks-1))
-        return loglike
-
-    def log_prior(self, theta):
-        if self.model == 1:
-            if self.ndenbins == 2:
-                fs8, sigma_v1, sigma_v2, epsilon = theta
-
-                if 0.1 < fs8 < 2.0 \
-                and 10 < sigma_v1 < 700 \
-                and 10 < sigma_v2 < 700 \
-                and 0.8 < epsilon < 1.2:
-                    return 0.0
-
-            if self.ndenbins == 3:
-                fs8, sigma_v1, sigma_v2, sigma_v3, epsilon = theta
-
-                if 0.1 < fs8 < 2.0 \
-                and 10 < sigma_v1 < 700 \
-                and 10 < sigma_v2 < 700 \
-                and 10 < sigma_v3 < 700 \
-                and 0.8 < epsilon < 1.2:
-                    return 0.0
-
-            if self.ndenbins == 4:
-                fs8, sigma_v1, sigma_v2, sigma_v3, sigma_v4, epsilon = theta
-
-                if 0.1 < fs8 < 2.0 \
-                and 10 < sigma_v1 < 700 \
-                and 10 < sigma_v2 < 700 \
-                and 10 < sigma_v3 < 700 \
-                and 10 < sigma_v4 < 700 \
-                and 0.8 < epsilon < 1.2:
-                    return 0.0
-
-            if self.ndenbins == 5:
-                fs8, sigma_v1, sigma_v2, sigma_v3, sigma_v4, sigma_v5, epsilon = theta
-
-                if 0.1 < fs8 < 2.0 \
-                and 10 < sigma_v1 < 700 \
-                and 10 < sigma_v2 < 700 \
-                and 10 < sigma_v3 < 700 \
-                and 10 < sigma_v4 < 700 \
-                and 10 < sigma_v5 < 700 \
-                and 0.8 < epsilon < 1.2:
-                    return 0.0
-
-        return -np.inf
-
-
-    def model1_theory(self, fs8, sigma_v, alpha_perp, alpha_para, s, mu, denbin):
-        '''
-        Gaussian streaming model (Fisher 1995)
-        '''
-        beta = fs8 / (self.b * self.s8norm)
-        monopole = np.zeros(len(s))
-        quadrupole = np.zeros(len(s))
-        hexadecapole = np.zeros(len(s))
-        true_mu = np.zeros(len(mu))
-        xi_model = np.zeros(len(mu))
-
-        # rescale input monopole functions to account for alpha values
-        mus = np.linspace(0, 1., 100)
-        r = self.r_for_xi[denbin]
-        rescaled_r = np.zeros_like(r)
-        for i in range(len(r)):
-            rescaled_r[i] = np.trapz((r[i] * alpha_para) * np.sqrt(1. + (1. - mus ** 2) *
-                            (alpha_perp ** 2 / alpha_para ** 2 - 1)), mus)
-
-        x = rescaled_r
-        y1 = self.xi_r[denbin](r)
-        y2 = self.int_xi_r[denbin](r)
-        y3 = self.sv[denbin](r, self.mu_for_v[denbin])
-
-        # build rescaled interpolating functions using the relabelled separation vectors
-        rescaled_xi_r = InterpolatedUnivariateSpline(x, y1, k=3, ext=0)
-        rescaled_int_xi_r = InterpolatedUnivariateSpline(x, y2, k=3, ext=0)
-        rescaled_sv = RectBivariateSpline(x, self.mu_for_v[denbin], y3)
-        sigma_v = alpha_para * sigma_v
-
-        for i in range(len(s)):
-            for j in range(len(mu)):
-                true_sperp = s[i] * np.sqrt(1 - mu[j] ** 2) * alpha_perp
-                true_spar = s[i] * mu[j] * alpha_para
-                true_s = np.sqrt(true_spar ** 2. + true_sperp ** 2.)
-                true_mu[j] = true_spar / true_s
-
-                rpar = true_spar
-
-                # build the integration variable
-                sy = 500 * self.iaH
-                y = np.linspace(-5 * sy, 5 * sy, 200)
-
-                rpary = rpar - y
-                rr = np.sqrt(true_sperp ** 2 + rpary ** 2)
-                mur = rpary / rr
-                sy = sigma_v * rescaled_sv.ev(rr, mur) * self.iaH
-
-                if self.vr_coupling == 'true':
-                    vrmu = self.vr(rr) * mur * self.iaH
-                elif self.vr_coupling == 'autocorr':
-                    alpha = 0.5
-                    int2_xi_r = rescaled_int_xi_r(rr) / (1 + rescaled_xi_r(rr))
-                    vrmu = -2/3 * beta * rr * int2_xi_r * (1 + alpha * int2_xi_r) * mur
-                else:
-                    vrmu = -1/3 * beta * rr * rescaled_int_xi_r(rr) * mur
-
-                los_pdf = norm.pdf(y, loc=vrmu, scale=sy)
-
-                integrand = los_pdf * (1 + rescaled_xi_r(rr))
-
-                xi_model[j] = simps(integrand, y) - 1
-
-
-            # build interpolating function for xi_smu at true_mu
-            mufunc = InterpolatedUnivariateSpline(true_mu[np.argsort(true_mu)],
-                                                  xi_model[np.argsort(true_mu)],
-                                                  k=3, ext=0)
-
-            if true_mu.min() < 0:
-                mumin = -1
-                factor = 2
-            else:
-                mumin = 0
-                factor = 1
-        
-            # get multipoles
-            xaxis = np.linspace(mumin, 1, 1000)
-
-            ell = 0
-            lmu = eval_legendre(ell, xaxis)
-            yaxis = mufunc(xaxis) * (2 * ell + 1) / factor * lmu
-            monopole[i] = simps(yaxis, xaxis)
-
-            ell = 2
-            lmu = eval_legendre(ell, xaxis)
-            yaxis = mufunc(xaxis) * (2 * ell + 1) / factor * lmu
-            quadrupole[i] = simps(yaxis, xaxis)
-
-            ell = 4
-            lmu = eval_legendre(ell, xaxis)
-            yaxis = mufunc(xaxis) * (2 * ell + 1) / factor * lmu
-            hexadecapole[i] = simps(yaxis, xaxis)
-
-        return monopole, quadrupole, hexadecapole
+def SphericalCollapse(g, lna, Omega_m0, Omega_L0):
+    '''
+    Collapse of a spherical shell. Solution to the ODE
+
+    y'' + (1/2 - 3/2 w om_l) y' + om_m/2 (y^{-3} - 1) y = 0
+
+    Let h = y'
+    h' + (1/2 - 3/2 w om_l) h + om_m/2 (y^{-3} - 1) y = 0
+    '''
+    om_m = Omega_m(lna, Omega_m0=Omega_m0, Omega_L0=Omega_L0)
+    om_l = Omega_L(lna, Omega_m0=Omega_m0, Omega_L0=Omega_L0)
+    y, h = g
+    dgda = [h, -(1/2 + 3/2*om_l)*h - om_m/2*(y**(-3) - 1)*y]
+    return dgda
+
+def Omega_m(lna, Omega_m0, Omega_L0):
+    a = np.exp(lna)
+    om_m = Omega_m0 / (Omega_m0 + Omega_L0 * a**3)
+    return om_m
+
+def Omega_L(lna, Omega_m0, Omega_L0):
+    a = np.exp(lna)
+    om_l = Omega_L0 / (Omega_m0 * a**-3 + Omega_L0)
+    return om_l
+
+def CosmologicalTime(zi, zf):
+    ai = np.log(1/(1 + zi))
+    af = np.log(1/(1 + zf))
+    t = np.linspace(ai, af, 10000)
+    return t
+
+def Hubble(a, Omega_m0, Omega_L0):
+    return 100 * np.sqrt(Omega_m0 * a ** -3 + Omega_L0)
 
 
